@@ -1,102 +1,172 @@
+
 # main.py
-import time, keyboard
-from config import *
+
+from __future__ import annotations
+
+import time
+import threading
+import keyboard
+
+from config import (
+    WINDOW_TITLE, MAP_W, MAP_H,
+    MOVE_STEP_DEFAULT, MOVE_PIXEL_PER_TILE,
+    TICK, NEAR_RADIUS,
+    MOVE_CHECK_TIMEOUT, MOVE_CHECK_POLL
+)
+
+import windowing
 import vision
 import combat
 import navigation
-from input_ctrl import right_click, press_key, move_dir
+from events import DisappearWatcher
+from input_ctrl import right_click, press_key
 
-state = combat.CombatState()
-nav = navigation.Navigator(MAP_W, MAP_H, stride=2)
 
 running = False
+quit_flag = False
+move_step = MOVE_STEP_DEFAULT
+
 
 def on_start():
     global running
     running = True
     print("▶ START")
 
+
 def on_stop():
     global running
     running = False
     print("■ STOP")
 
-keyboard.add_hotkey("F1", on_start)
-keyboard.add_hotkey("F2", on_stop)
-print("F1 시작 / F2 정지")
 
-def wait_coord_change(before):
-    """이동 후 좌표가 바뀌는지 일정 시간 대기. 바뀌면 새 좌표 반환, 아니면 None."""
+def wait_coord_change(grabber: vision.Grabber, before):
     t0 = time.time()
     while time.time() - t0 < MOVE_CHECK_TIMEOUT:
-        cur = vision.read_game_coord()
+        cur = vision.read_game_coord(grabber)
         if cur is not None and cur != before:
             return cur
         time.sleep(MOVE_CHECK_POLL)
     return None
 
-while True:
-    if not running:
-        time.sleep(0.2)
-        continue
 
-    # 1) 게임 내부 좌표 읽기(필수)
-    cur_cell = vision.read_game_coord()
-    if cur_cell is None:
-        # 좌표 못 읽으면 잠깐 대기 (인식 튜닝 필요)
-        time.sleep(0.2)
-        continue
+def console_loop(nav: navigation.Navigator):
+    global quit_flag, move_step
+    while not quit_flag:
+        cmd = input(">> ").strip().lower()
+        if cmd == "quit":
+            quit_flag = True
+        elif cmd.startswith("step "):
+            try:
+                n = int(cmd.split()[1])
+                n = max(1, min(5, n))
+                move_step = n
+                print(f"[OK] move_step={move_step}")
+            except:
+                print("예: step 3")
+        elif cmd.startswith("stride "):
+            try:
+                n = int(cmd.split()[1])
+                n = max(1, min(10, n))
+                nav.set_stride(n)
+                print(f"[OK] stride={n}")
+            except:
+                print("예: stride 2")
+        elif cmd == "status":
+            print(f"running={running} move_step={move_step} path_i={nav.path_i} goal_i={nav.goal_i}")
 
-    # 2) 화면상의 캐릭터 중심(우클릭 이동에 필요)
-    char = vision.find_character_center()
-    if not char:
-        time.sleep(0.2)
-        continue
-    mx, my = char
 
-    # 3) 몬스터 인식 및 전투 판단(기존)
-    monsters = vision.find_monsters()
-    near = 0
-    far = 0
-    target = None
+def main():
+    global quit_flag
 
-    for x, y in monsters:
-        d = max(abs(x-mx), abs(y-my))
-        if d <= NEAR_RADIUS:
-            near += 1
-        else:
-            far += 1
-        if not target or d < max(abs(target[0]-mx), abs(target[1]-my)):
-            target = (x, y)
+    hwnd = windowing.find_window(WINDOW_TITLE)
+    if not hwnd:
+        print(f"[ERR] 창을 찾을 수 없습니다: {WINDOW_TITLE}")
+        return
 
-    acts = combat.decision(state, near, far, target)
+    windowing.bring_to_front(hwnd)
+    windowing.move_window(hwnd, 0, 0)
+    rect = windowing.get_window_rect(hwnd)
 
-    # 4) 전투 액션 수행
-    for a, t in acts:
-        if a == "AIM":
-            right_click(t[0], t[1])
-        else:
-            press_key(a)
+    grabber = vision.Grabber(rect)
 
-    # 5) 전투 행동이 없으면 이동
-    if not acts:
-        d = nav.next_dir(cur_cell)
-        if d is None:
-            time.sleep(TICK)
+    cstate = combat.CombatState()
+    watcher = DisappearWatcher()
+    nav = navigation.Navigator(MAP_W, MAP_H, stride=2)
+
+    keyboard.add_hotkey("F1", on_start)
+    keyboard.add_hotkey("F2", on_stop)
+
+    threading.Thread(target=console_loop, args=(nav,), daemon=True).start()
+
+    print("F1 시작 / F2 정지")
+    print("콘솔: step N | stride N | status | quit")
+
+    while not quit_flag:
+        if not running:
+            time.sleep(0.2)
             continue
 
-        dx, dy = d
+        windowing.bring_to_front(hwnd)
 
-        # 이동 시도(화면 우클릭)
-        move_dir(mx, my, dx, dy, MOVE_STEP)
+        cur_cell = vision.read_game_coord(grabber)
+        if cur_cell is None:
+            time.sleep(0.1)
+            continue
 
-        # 이동 성공/실패 판정: 좌표가 바뀌면 성공
-        new_cell = wait_coord_change(cur_cell)
-        if new_cell is None:
-            # ❌ 좌표 변화 없음: 막힘 판정 -> 장애물 학습/우회
-            nav.on_move_blocked(cur_cell, dx, dy)
-        else:
-            # ✅ 좌표 변화: 이동 성공
-            nav.on_move_success(new_cell, MOVE_STEP)
+        win_gray = grabber.grab_gray()
 
-    time.sleep(TICK)
+        char = vision.find_character_center(win_gray)
+        if char is None:
+            time.sleep(0.1)
+            continue
+        cx, cy = char
+
+        monsters = vision.find_monsters(win_gray)
+        near = 0
+        far = 0
+        target = None
+
+        for mx, my in monsters:
+            dx_t = abs(mx - cx) / max(1, MOVE_PIXEL_PER_TILE)
+            dy_t = abs(my - cy) / max(1, MOVE_PIXEL_PER_TILE)
+            d = max(dx_t, dy_t)
+            if d <= NEAR_RADIUS:
+                near += 1
+            else:
+                far += 1
+            if target is None or d < target[2]:
+                target = (mx, my, d)
+
+        target_xy = (target[0], target[1]) if target else None
+
+        special_present = vision.check_special(win_gray)
+        watcher.update(special_present)
+        for key in watcher.pop_actions(max_n=3):
+            press_key(key)
+
+        acts = combat.decision(cstate, near, far, target_xy)
+        for kind, val in acts:
+            if kind == "AIM":
+                right_click(val[0], val[1])
+            elif kind == "PRESS":
+                press_key(val)
+
+        if not acts:
+            dxy = nav.next_dir(cur_cell)
+            if dxy is not None:
+                dx, dy = dxy
+                tx = cx + dx * MOVE_PIXEL_PER_TILE * move_step
+                ty = cy + dy * MOVE_PIXEL_PER_TILE * move_step
+                right_click(int(tx), int(ty))
+
+                new_cell = wait_coord_change(grabber, cur_cell)
+                if new_cell is None:
+                    nav.on_move_blocked(cur_cell, dx, dy)
+                else:
+                    nav.on_move_success(new_cell, move_step)
+
+        time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    main()
