@@ -16,15 +16,28 @@ from config import (
 
 import windowing
 import vision
+print("vision loaded from:", vision.__file__)
 import combat
 import navigation
 from events import DisappearWatcher
 from input_ctrl import right_click, press_key
-
-
+from config import COORD_REGION
+import vision_coord_robust as v
 running = False
 quit_flag = False
 move_step = MOVE_STEP_DEFAULT
+
+last_coord = None                 # 마지막으로 읽힌 게임 내부 좌표
+last_coord_time = 0.0            # 마지막 좌표 갱신 시각
+coord_grace_sec = 0.8            # 잠깐 OCR 실패해도 last_coord로 버틸 시간
+
+pending_move = None              # (before_coord, dx, dy, step, start_time)
+move_timeout = 1.2               # 이동 후 좌표 변화 기다릴 최대 시간
+move_poll = 0.10                 # 좌표 재확인 주기
+
+# 선택: 포커스/전면은 매 틱마다 하지 말고 주기적으로만
+last_focus_time = 0.0
+focus_every_sec = 2.
 
 
 def on_start():
@@ -42,7 +55,7 @@ def on_stop():
 def wait_coord_change(grabber: vision.Grabber, before):
     t0 = time.time()
     while time.time() - t0 < MOVE_CHECK_TIMEOUT:
-        cur = vision.read_game_coord(grabber)
+        cur = vision.read_game_coord(grabber,COORD_REGION, debug=True)
         if cur is not None and cur != before:
             return cur
         time.sleep(MOVE_CHECK_POLL)
@@ -86,7 +99,7 @@ def main():
     windowing.bring_to_front(hwnd)
     windowing.move_window(hwnd, 0, 0)
     rect = windowing.get_window_rect(hwnd)
-
+    
     grabber = vision.Grabber(rect)
 
     cstate = combat.CombatState()
@@ -108,7 +121,7 @@ def main():
 
         windowing.bring_to_front(hwnd)
 
-        cur_cell = vision.read_game_coord(grabber)
+        cur_cell = vision.read_game_coord(grabber, COORD_REGION, debug=True,scale=1.0)
         if cur_cell is None:
             time.sleep(0.1)
             continue
